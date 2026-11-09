@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BFPT Bios</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+  <style>
+    :root {
+      --bg: #faf8f5;
+      --surface: #ffffff;
+      --text: #1f1d1a;
+      --muted: #6b665e;
+      --border: #e3ded6;
+      --accent: #8a3b12;
+      --error: #b42318;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #141311;
+        --surface: #1d1b18;
+        --text: #ece8e1;
+        --muted: #a39d93;
+        --border: #34302a;
+        --accent: #e59a6b;
+        --error: #ff8a80;
+      }
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Georgia, 'Times New Roman', serif;
+      line-height: 1.6;
+    }
+    main {
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 32px 16px 64px;
+    }
+
+    .picker {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px 12px;
+      margin-bottom: 32px;
+      font-family: system-ui, sans-serif;
+    }
+    .picker label { color: var(--muted); font-size: 14px; }
+    .picker select {
+      flex: 1 1 260px;
+      min-width: 0;
+      padding: 8px 10px;
+      font-size: 16px;
+      color: var(--text);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+
+    #status { font-family: system-ui, sans-serif; color: var(--muted); }
+    #status.error { color: var(--error); }
+
+    h1 {
+      margin: 0 0 24px;
+      font-size: clamp(28px, 6vw, 40px);
+      line-height: 1.2;
+      font-weight: normal;
+    }
+
+    .field { margin-bottom: 28px; }
+    .field h2 {
+      margin: 0 0 6px;
+      font-family: system-ui, sans-serif;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+    .field p { margin: 0; }
+    .field ul { margin: 0; padding-left: 20px; }
+    .field li { margin-bottom: 4px; }
+    .field .empty { color: var(--muted); font-style: italic; }
+  </style>
+</head>
+
+<body>
+  <main>
+    <div class="picker">
+      <label for="person">Select a person</label>
+      <select id="person" disabled>
+        <option>Loading&hellip;</option>
+      </select>
+    </div>
+
+    <div id="status">Loading bfpt-bios.xlsx&hellip;</div>
+    <article id="bio" hidden></article>
+  </main>
+
+  <script>
+    const SPREADSHEET_FILE = './bfpt-bios.xlsx';
+    const DEFAULT_TITLE = 'BFPT Bios';
+
+    const selectEl = document.getElementById('person');
+    const statusEl = document.getElementById('status');
+    const bioEl = document.getElementById('bio');
+
+    // Turns the first sheet into { headers, people }, where each person is
+    // an array of cell values in header order. The first column is the name.
+    // raw:false gives each cell's displayed text, so Excel dates come through
+    // formatted (e.g. "06/01/1946") rather than as serial numbers.
+    async function loadPeople() {
+      const res = await fetch(SPREADSHEET_FILE);
+      if (!res.ok) {
+        throw new Error(`Could not fetch ${SPREADSHEET_FILE} (HTTP ${res.status}).`);
+      }
+      const buf = await res.arrayBuffer();
+      const workbook = XLSX.read(buf, { type: 'array', cellDates: true });
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(sheet, {
+        header: 1, defval: '', raw: false, dateNF: 'mmmm d, yyyy',
+      });
+
+      const headers = rows[0].map(h => String(h).trim());
+      const people = rows.slice(1)
+        .map(row => headers.map((_, i) => String(row[i] ?? '').trim()))
+        .filter(row => row[0]);
+      return { headers, people };
+    }
+
+    // Fields like Publications hold several items separated by semicolons;
+    // show those as a list instead of one long run-on paragraph.
+    function renderValue(value) {
+      if (!value) {
+        const p = document.createElement('p');
+        p.className = 'empty';
+        p.textContent = 'Not yet available';
+        return p;
+      }
+      const parts = value.split(';').map(s => s.trim()).filter(Boolean);
+      if (parts.length > 1) {
+        const ul = document.createElement('ul');
+        for (const part of parts) {
+          const li = document.createElement('li');
+          li.textContent = part;
+          ul.appendChild(li);
+        }
+        return ul;
+      }
+      const p = document.createElement('p');
+      p.textContent = value;
+      return p;
+    }
+
+    function showPerson(headers, person) {
+      const name = person[0];
+      document.title = name;
+
+      bioEl.replaceChildren();
+      const h1 = document.createElement('h1');
+      h1.textContent = name;
+      bioEl.appendChild(h1);
+
+      headers.slice(1).forEach((header, i) => {
+        const section = document.createElement('section');
+        section.className = 'field';
+        const h2 = document.createElement('h2');
+        h2.textContent = header;
+        section.append(h2, renderValue(person[i + 1]));
+        bioEl.appendChild(section);
+      });
+      bioEl.hidden = false;
+    }
+
+    loadPeople()
+      .then(({ headers, people }) => {
+        if (people.length === 0) throw new Error('The spreadsheet has no named rows.');
+
+        selectEl.replaceChildren(...people.map((person, i) => new Option(person[0], i)));
+        selectEl.disabled = false;
+        statusEl.hidden = true;
+
+        // The URL hash (e.g. bios.html#Audre%20Lorde) picks who to show
+        // first, so a specific person's page can be linked to directly.
+        const hashName = decodeURIComponent(location.hash.slice(1));
+        const initial = Math.max(0, people.findIndex(p => p[0] === hashName));
+        selectEl.value = initial;
+        showPerson(headers, people[initial]);
+
+        selectEl.addEventListener('change', () => {
+          const person = people[selectEl.value];
+          history.replaceState(null, '', '#' + encodeURIComponent(person[0]));
+          showPerson(headers, person);
+        });
+      })
+      .catch(err => {
+        document.title = DEFAULT_TITLE;
+        statusEl.classList.add('error');
+        statusEl.textContent =
+          `Could not load the bios: ${err.message} ` +
+          `Make sure this page is opened through a web server (not double-clicked as a file), ` +
+          `and that bfpt-bios.xlsx is in the same folder as bios.html.`;
+        console.error(err);
+      });
+  </script>
+</body>
+</html>
