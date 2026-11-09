@@ -1,8 +1,9 @@
 <head>
-  <style> body { margin: 0; } </style>
+  <meta charset="utf-8">
+  <style> body { margin: 0; background: #000; } </style>
 
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
   <script src="//cdn.jsdelivr.net/npm/3d-force-graph"></script>
-<!--  <script src="../../dist/3d-force-graph.js"></script>-->
 
   <style>
     .node-label {
@@ -12,28 +13,168 @@
       background-color: rgba(0,0,0,0.5);
       user-select: none;
     }
+    #status {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: #eee;
+      font-family: sans-serif;
+      font-size: 14px;
+      max-width: 480px;
+      z-index: 10;
+    }
+    #status.error { color: #ff6b6b; }
   </style>
 </head>
 
 <body>
+  <div id="status">Loading BFPT_Sheet_2.5.xlsx&hellip;</div>
   <div id="3d-graph"></div>
 
   <script type="module">
     import { CSS2DRenderer, CSS2DObject } from 'https://esm.sh/three/examples/jsm/renderers/CSS2DRenderer.js';
 
-    const Graph = new ForceGraph3D(document.getElementById('3d-graph'), {
-      extraRenderers: [new CSS2DRenderer()]
-    })
-      .jsonUrl('../datasets/miserables.json')
-      .nodeAutoColorBy('group')
-      .nodeThreeObject(node => {
-        const nodeEl = document.createElement('div');
-        nodeEl.textContent = node.id;
-        nodeEl.style.color = node.color;
-        nodeEl.className = 'node-label';
-        return new CSS2DObject(nodeEl);
+    const SPREADSHEET_FILE = './BFPT_Sheet_2.5.xlsx';
+    const statusEl = document.getElementById('status');
+
+    // --- Name normalization ----------------------------------------------
+    // The spreadsheet isn't perfectly consistent about how a name is typed
+    // from row to row (e.g. "Beverly Guy-Sheftall" vs "Beverly Guy Sheftall").
+    // normKey() collapses those harmless differences (case, punctuation,
+    // hyphens vs spaces, extra whitespace) into one comparison key so they
+    // become a single node instead of two.
+    function normKey(s) {
+      return String(s)
+        .trim()
+        .toLowerCase()
+        .replace(/[-–—]/g, ' ')
+        .replace(/\s+/g, ' ');
+    }
+
+    // Outright typos that normKey() can't fix on its own (different letters,
+    // not just different punctuation/spacing). Add a line here if a future
+    // version of the spreadsheet introduces a new misspelling:
+    // 'typo\'s normKey form': 'correct name\'s normKey form'
+    const NAME_ALIASES = {
+      'johnetta bestch cole': 'johnnetta betsch cole',
+    };
+
+    function findColumn(headers, mustInclude) {
+      return headers.findIndex(h =>
+        mustInclude.every(token => String(h || '').toLowerCase().includes(token))
+      );
+    }
+
+    async function loadGraphData() {
+      const res = await fetch(SPREADSHEET_FILE);
+      if (!res.ok) {
+        throw new Error(`Could not fetch ${SPREADSHEET_FILE} (HTTP ${res.status}).`);
+      }
+      const buf = await res.arrayBuffer();
+      const workbook = XLSX.read(buf, { type: 'array' });
+
+      // First sheet holds the citation data.
+      const dataSheet = workbook.Sheets[workbook.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(dataSheet, { header: 1, defval: '' });
+      const headers = rows[0];
+
+      const primaryIdx = findColumn(headers, ['primary', 'theorist']);
+      const secondaryIdx = findColumn(headers, ['secondary', 'theorist']);
+      if (primaryIdx === -1 || secondaryIdx === -1) {
+        throw new Error('Could not find "Primary" / "Secondary Black Feminist Theorist" columns in the first sheet.');
+      }
+
+      // "Name Key" sheet (if present) gives the authoritative spelling of
+      // each name. We prefer those spellings when displaying nodes.
+      const canonicalDisplay = new Map(); // normKey -> display name
+      const nameKeySheet = workbook.Sheets['Name Key'];
+      if (nameKeySheet) {
+        const nameKeyRows = XLSX.utils.sheet_to_json(nameKeySheet, { header: 1, defval: '' });
+        for (const row of nameKeyRows.slice(1)) {
+          const name = String(row[0] || '').trim();
+          if (!name) continue;
+          const key = normKey(name);
+          if (!canonicalDisplay.has(key)) canonicalDisplay.set(key, name);
+        }
+      }
+
+      function resolveName(raw) {
+        let key = normKey(raw);
+        if (NAME_ALIASES[key]) key = NAME_ALIASES[key];
+        if (canonicalDisplay.has(key)) return canonicalDisplay.get(key);
+        const display = String(raw).trim();
+        canonicalDisplay.set(key, display); // so later rows with the same variant match this one
+        return display;
+      }
+
+      // Build one aggregated, undirected edge per pair of names that share a
+      // row, weighted by how many rows that pair co-occurs in.
+      const linkMap = new Map(); // "A|||B" -> { source, target, weight }
+      for (const row of rows.slice(1)) {
+        const primaryRaw = row[primaryIdx];
+        const secondaryRaw = row[secondaryIdx];
+        if (!primaryRaw || !secondaryRaw) continue;
+
+        const a = resolveName(primaryRaw);
+        const b = resolveName(secondaryRaw);
+        if (a === b) continue;
+
+        const [source, target] = [a, b].sort();
+        const pairKey = `${source}|||${target}`;
+        if (!linkMap.has(pairKey)) linkMap.set(pairKey, { source, target, weight: 0 });
+        linkMap.get(pairKey).weight++;
+      }
+
+      const degree = new Map(); // name -> total connection weight (node size)
+      for (const { source, target, weight } of linkMap.values()) {
+        degree.set(source, (degree.get(source) || 0) + weight);
+        degree.set(target, (degree.get(target) || 0) + weight);
+      }
+
+      const nodes = Array.from(degree.keys()).map(id => ({
+        id,
+        val: 1 + Math.sqrt(degree.get(id)),
+      }));
+      const links = Array.from(linkMap.values()).map(l => ({
+        source: l.source,
+        target: l.target,
+        value: l.weight,
+      }));
+
+      return { nodes, links };
+    }
+
+    loadGraphData()
+      .then(({ nodes, links }) => {
+        statusEl.textContent = `${nodes.length} theorists, ${links.length} connections`;
+        setTimeout(() => { statusEl.style.display = 'none'; }, 4000);
+
+        const Graph = new ForceGraph3D(document.getElementById('3d-graph'), {
+          extraRenderers: [new CSS2DRenderer()],
+        })
+          .graphData({ nodes, links })
+          .nodeAutoColorBy('id')
+          .nodeVal('val')
+          .nodeThreeObject(node => {
+            const nodeEl = document.createElement('div');
+            nodeEl.textContent = node.id;
+            nodeEl.style.color = node.color;
+            nodeEl.className = 'node-label';
+            return new CSS2DObject(nodeEl);
+          })
+          .nodeThreeObjectExtend(true)
+          .linkWidth(link => 1 + Math.log2(link.value))
+          .linkOpacity(0.5)
+          .linkLabel(link => `${link.source.id} ↔ ${link.target.id}: ${link.value} citation${link.value > 1 ? 's' : ''}`)
+        ;
       })
-      .nodeThreeObjectExtend(true)
-    ;
+      .catch(err => {
+        statusEl.classList.add('error');
+        statusEl.textContent =
+          `Could not load the graph: ${err.message} ` +
+          `Make sure this page is opened through a web server (not double-clicked as a file), ` +
+          `and that BFPT_Sheet_2.5.xlsx is in the same folder as index.html.`;
+        console.error(err);
+      });
   </script>
 </body>
